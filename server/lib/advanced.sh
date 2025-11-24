@@ -2,101 +2,89 @@
 
 # === СТАТИСТИКА ===
 check_stats() {
-    # 1. Ищем порт API в конфиге
     if [ ! -f "$SERVER_CONF" ]; then
         echo -e "${RED}Конфиг не найден!${Font}"
         return
     fi
     
-    # Парсим порт из yaml (грубо, через grep, чтобы не зависеть от yq)
-    # Ищем строку "  listen: 127.0.0.1:XXXX" под блоком "http:"
+    # Парсим порт из конфига
     API_PORT=$(grep -A 1 "^http:" "$SERVER_CONF" | grep "listen" | awk -F':' '{print $2}' | tr -d ' ')
     
     if [[ -z "$API_PORT" ]]; then
-        echo -e "${RED}В конфиге не включен HTTP API! Статистика недоступна.${Font}"
-        echo "Переустановите сервер через пункт 1 или добавьте блок 'http' в конфиг вручную."
+        echo -e "${RED}API выключен в конфиге.${Font}"
         return
     fi
 
-    # 2. Запрашиваем статистику
-    echo -e "${BLUE}>>> Запрос статистики (Hysteria 2 API)...${Font}"
+    echo -e "${BLUE}>>> Запрос статистики...${Font}"
     
+    # Проверка наличия jq
     if ! command -v jq &> /dev/null; then
-        echo "Устанавливаем jq для парсинга JSON..."
-        apt-get install -y jq &>/dev/null || yum install -y jq &>/dev/null
+        echo "Ошибка: jq не установлен. (Странно, он должен был поставиться в зависимостях)"
+        return
     fi
 
-    STATS_JSON=$(curl -s "http://127.0.0.1:$API_PORT/traffic")
+    STATS_JSON=$(curl -s --max-time 3 "http://127.0.0.1:$API_PORT/traffic")
     
     if [[ -z "$STATS_JSON" ]]; then
-        echo -e "${RED}Не удалось получить данные. Сервер запущен?${Font}"
+        echo -e "${RED}Сервер не отвечает (API Port: $API_PORT).${Font}"
         return
     fi
 
-    # 3. Вывод
-    TX=$(echo "$STATS_JSON" | jq .tx)
-    RX=$(echo "$STATS_JSON" | jq .rx)
+    TX=$(echo "$STATS_JSON" | jq .tx 2>/dev/null)
+    RX=$(echo "$STATS_JSON" | jq .rx 2>/dev/null)
     
-    # Конвертация байт в МБ/ГБ
+    if [[ -z "$TX" ]]; then
+        echo -e "${RED}Ошибка парсинга JSON.${Font}"
+        return
+    fi
+    
     format_bytes() {
-        num=$1
-        if [ $num -gt 1073741824 ]; then
-            echo "$(echo "scale=2; $num/1073741824" | bc) GB"
+        if command -v bc &> /dev/null; then
+            num=$1
+            if [ $(echo "$num > 1073741824" | bc) -eq 1 ]; then
+                echo "$(echo "scale=2; $num/1073741824" | bc) GB"
+            else
+                echo "$(echo "scale=2; $num/1048576" | bc) MB"
+            fi
         else
-            echo "$(echo "scale=2; $num/1048576" | bc) MB"
+            echo "$1 Bytes (Install 'bc' for human readable)"
         fi
     }
-    
-    # Для bc (калькулятора) если его нет
-    if ! command -v bc &> /dev/null; then apt-get install -y bc &>/dev/null; fi
 
-    echo -e "${GREEN}================================${Font}"
-    echo -e "Трафик (с момента запуска):"
-    echo -e "Отправлено (TX): ${YELLOW}$(format_bytes $TX)${Font}"
-    echo -e "Принято (RX):    ${YELLOW}$(format_bytes $RX)${Font}"
-    echo -e "${GREEN}================================${Font}"
+    echo -e "${GREEN}=== TRAFFIC ===${Font}"
+    echo -e "TX (Out): ${YELLOW}$(format_bytes $TX)${Font}"
+    echo -e "RX (In):  ${YELLOW}$(format_bytes $RX)${Font}"
+    echo -e "${GREEN}===============${Font}"
 }
 
-# === ОБНОВЛЕНИЕ СКРИПТА ===
-update_hihy() {
-    echo -e "${BLUE}>>> Обновление Hysteria Manager...${Font}"
-    cd /etc/hihy || exit
-    git pull
-    chmod +x server/hihy
-    chmod +x server/lib/*.sh
-    echo -e "${GREEN}Обновление завершено! Перезапустите скрипт.${Font}"
-    exit 0
+# === ЛОГИ ===
+show_log() {
+    echo -e "${BLUE}Нажмите Ctrl+C для выхода...${Font}"
+    journalctl -u hihy -f -n 100
 }
 
-# === ОБНОВЛЕНИЕ ЯДРА ===
-update_core() {
-    echo -e "${BLUE}>>> Проверка новой версии Hysteria 2...${Font}"
-    # Тут можно добавить парсинг API Github, но пока просто перекачаем latest
-    systemctl stop hihy
-    
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64) ARCH="amd64" ;;
-        aarch64) ARCH="arm64" ;;
-        *) echo "Arch not supported"; return ;;
-    esac
-    
-    wget -q --show-progress -O "$APP_BIN" "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH}"
-    chmod +x "$APP_BIN"
-    
-    systemctl start hihy
-    echo -e "${GREEN}Ядро обновлено до Latest!${Font}"
-}
+# === ЗАГЛУШКИ ДЛЯ ОТСУТСТВУЮЩЕГО ФУНКЦИОНАЛА ===
 
-# === SOCKS5 (Упрощенно) ===
-add_socks5_outbound() {
-    echo -e "${YELLOW}Функция добавления Socks5 (WARP) пока в разработке.${Font}"
-    echo -e "В Hysteria 2 это делается через добавление 'socks5' в секцию 'outbounds' конфига."
-    echo -e "Рекомендуется пока использовать готовый клиент WARP отдельно."
-}
-
-# === ACL ===
 manage_acl() {
-    echo -e "${YELLOW}Управление ACL (GeoIP) пока в разработке.${Font}"
-    echo -e "По умолчанию Hysteria 2 работает без блокировок."
+    echo -e "${YELLOW}Функционал ACL еще не реализован в этой версии.${Font}"
+}
+
+add_socks5_outbound() {
+    echo -e "${YELLOW}Добавление Socks5 Outbound временно отключено.${Font}"
+}
+
+switch_ipv4_ipv6() {
+    echo -e "${YELLOW}Переключение приоритета IPv4/IPv6 еще не реализовано.${Font}"
+    echo "Вы можете вручную настроить это в системном /etc/gai.conf"
+}
+
+update_core() {
+    echo -e "${BLUE}Обновление ядра...${Font}"
+    install_hy2 # Просто переустанавливаем бинарник
+}
+
+update_hihy() {
+    echo -e "${BLUE}Обновление скрипта...${Font}"
+    echo "Функция 'git pull' требует, чтобы папка была git-репозиторием."
+    echo "Если вы скачали скрипт вручную, скачайте его заново."
 }

@@ -13,14 +13,46 @@ get_arch() {
     esac
 }
 
-# === УСТАНОВКА ===
+# === УПРАВЛЕНИЕ СЛУЖБОЙ ===
+start_service() { systemctl start hihy; echo -e "${GREEN}Служба запущена.${Font}"; }
+stop_service() { systemctl stop hihy; echo -e "${RED}Служба остановлена.${Font}"; }
+restart_service() { systemctl restart hihy; echo -e "${GREEN}Служба перезагружена.${Font}"; }
+show_status() { systemctl status hihy --no-pager; }
+
+# === УДАЛЕНИЕ ===
+uninstall() {
+    echo -e "${RED}!!! ВНИМАНИЕ !!!${Font}"
+    read -p "Вы действительно хотите удалить Hysteria 2? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        systemctl stop hihy
+        systemctl disable hihy
+        rm -f /etc/systemd/system/hihy.service
+        systemctl daemon-reload
+        rm -rf "$HY_DIR"
+        # Не удаляем /usr/bin/hihy если это симлинк на репо, но конфиг чистим
+        echo -e "${GREEN}Hysteria 2 удалена. (Скрипт управления остался)${Font}"
+    else
+        echo "Отмена."
+    fi
+}
+
+show_config() {
+    if [ -f "$SERVER_CONF" ]; then
+        echo -e "${BLUE}Текущий конфиг ($SERVER_CONF):${Font}"
+        cat "$SERVER_CONF"
+    else
+        echo -e "${RED}Конфиг не найден!${Font}"
+    fi
+}
+
+re_config() { install_hy2; }
+
+# === УСТАНОВКА (MAIN LOGIC) ===
 install_hy2() {
-    # 1. Проверка окружения
     check_root
     check_sys
     install_dependencies
 
-    # 2. Определение архитектуры и скачивание
     ARCH=$(get_arch)
     if [ "$ARCH" == "unknown" ]; then
         echo -e "${RED}Ошибка: Архитектура $(uname -m) не поддерживается!${Font}"
@@ -28,25 +60,25 @@ install_hy2() {
     fi
 
     echo -e "${BLUE}>>> Скачивание ядра Hysteria 2 ($ARCH)...${Font}"
-    # Используем API для получения последней версии (или хардкод на latest)
+    # Используем --max-redirect для надежности
     DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH}"
+    wget -q --show-progress --max-redirect 5 -O "$APP_BIN" "$DOWNLOAD_URL"
     
-    wget -q --show-progress -O "$APP_BIN" "$DOWNLOAD_URL"
-    chmod +x "$APP_BIN"
-
-    if [ ! -f "$APP_BIN" ]; then
-        echo -e "${RED}Ошибка: Скачивание не удалось. Проверьте сеть или GitHub API.${Font}"
+    if [ ! -s "$APP_BIN" ]; then
+        echo -e "${RED}Ошибка: Скачивание не удалось (файл пуст). Проверьте интернет.${Font}"
+        rm -f "$APP_BIN"
         exit 1
     fi
+    chmod +x "$APP_BIN"
 
-    # 3. WIZARD (Мастер настройки)
+    # --- WIZARD ---
     echo -e "${GREEN}>>> Настройка Hysteria 2${Font}"
 
-    # --- СЕРТИФИКАТ ---
-    echo -e "\n${YELLOW}(1/5) Сертификат:${Font}"
-    echo -e "${GREEN}1)${Font} Автоматический (ACME/Let's Encrypt) - Нужен домен и 80 порт"
-    echo -e "${GREEN}2)${Font} Самоподписанный (Self-signed) - Для работы по IP"
-    echo -e "${GREEN}3)${Font} Свои файлы (.crt + .key)"
+    # 1. Сертификат
+    echo -e "\n${YELLOW}(1/6) Сертификат:${Font}"
+    echo -e "${GREEN}1)${Font} ACME (Let's Encrypt) - Нужен домен + 80 порт"
+    echo -e "${GREEN}2)${Font} Self-signed (Bing) - Для IP (включите Allow Insecure в клиенте)"
+    echo -e "${GREEN}3)${Font} Свои файлы"
     read -p "Выбор [1]: " cert_choice
     cert_choice=${cert_choice:-1}
 
@@ -55,14 +87,14 @@ install_hy2() {
     
     if [[ "$cert_choice" == "1" ]]; then
         read -p "Введите ваш домен: " domain
+        if [[ -z "$domain" ]]; then echo -e "${RED}Домен обязателен!${Font}"; exit 1; fi
         tls_config="acme:
   domains:
     - $domain
   email: admin@$domain"
     elif [[ "$cert_choice" == "2" ]]; then
         echo -e "${BLUE}Генерируем самоподписанный сертификат...${Font}"
-        domain="www.bing.com" # Фейковый SNI для маскировки
-        # Для самоподписанного генерируем через openssl
+        domain="www.bing.com"
         openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$CERT_DIR/self.key" -out "$CERT_DIR/self.crt" -days 3650 -subj "/CN=$domain" 2>/dev/null
         tls_config="tls:
   cert: $CERT_DIR/self.crt
@@ -70,6 +102,7 @@ install_hy2() {
     elif [[ "$cert_choice" == "3" ]]; then
         read -p "Путь к .crt: " user_crt
         read -p "Путь к .key: " user_key
+        if [ ! -f "$user_crt" ] || [ ! -f "$user_key" ]; then echo -e "${RED}Файлы не найдены!${Font}"; exit 1; fi
         cp "$user_crt" "$CERT_DIR/custom.crt"
         cp "$user_key" "$CERT_DIR/custom.key"
         tls_config="tls:
@@ -77,45 +110,55 @@ install_hy2() {
   key: $CERT_DIR/custom.key"
     fi
 
-    # --- ПОРТЫ И HOPPING ---
-    echo -e "\n${YELLOW}(2/5) Порт сервера:${Font}"
+    # 2. Порты
+    echo -e "\n${YELLOW}(2/6) Порт сервера:${Font}"
     read -p "Основной порт [443]: " main_port
     main_port=${main_port:-443}
+    
+    # Проверка занятости порта
+    if lsof -i :$main_port >/dev/null 2>&1; then
+        echo -e "${RED}Внимание: Порт $main_port уже занят!${Font}"
+        read -p "Все равно использовать? [y/N]: " force_port
+        if [[ ! "$force_port" =~ ^[Yy]$ ]]; then exit 1; fi
+    fi
 
     listen_str=":$main_port"
+    hopping_range=""
 
-    echo -e "\n${YELLOW}(3/5) Включить Port Hopping? (Рекомендуется)${Font}"
-    echo -e "Это заставляет сервер слушать диапазон портов. Усложняет блокировку."
+    echo -e "\n${YELLOW}(3/6) Port Hopping (Диапазон портов):${Font}"
     read -p "Включить? [Y/n]: " hop_yn
     hop_yn=${hop_yn:-Y}
 
-    hopping_range=""
     if [[ "$hop_yn" =~ ^[Yy]$ ]]; then
         read -p "Диапазон [20000-50000]: " hop_range
         hop_range=${hop_range:-"20000-50000"}
-        # Синтаксис Hysteria 2: :443,20000-50000
         listen_str=":$main_port,$hop_range"
         hopping_range="$hop_range"
     fi
 
-    # --- ПАРОЛЬ ---
-    echo -e "\n${YELLOW}(4/5) Аутентификация:${Font}"
-    read -p "Пароль (Enter для генерации): " password
+    # 3. Скорость (Bandwidth) - ВАЖНО для Hysteria
+    echo -e "\n${YELLOW}(4/6) Скорость (Bandwidth):${Font}"
+    echo "Укажите РЕАЛЬНУЮ скорость (или чуть меньше). Не ставьте 1Gbps на 100Mbps канале!"
+    read -p "Скорость загрузки (Download) [100 mbps]: " bw_down
+    bw_down=${bw_down:-"100 mbps"}
+    read -p "Скорость отдачи (Upload) [100 mbps]: " bw_up
+    bw_up=${bw_up:-"100 mbps"}
+
+    # 4. Пароль
+    echo -e "\n${YELLOW}(5/6) Аутентификация:${Font}"
+    read -p "Пароль (Enter для автогенерации): " password
     if [[ -z "$password" ]]; then
         password=$(cat /proc/sys/kernel/random/uuid)
-        echo -e "Сгенерирован: ${GREEN}$password${Font}"
     fi
 
-    # --- МАСКИРОВКА ---
-    echo -e "\n${YELLOW}(5/5) Маскировка (Masquerade):${Font}"
+    # 5. Маскировка
+    echo -e "\n${YELLOW}(6/6) Маскировка:${Font}"
     read -p "Сайт-жертва [https://www.bing.com]: " masq_site
     masq_site=${masq_site:-"https://www.bing.com"}
 
-    # 4. ГЕНЕРАЦИЯ КОНФИГА
-    echo -e "${BLUE}>>> Запись конфигурации...${Font}"
-    
-    # Генерируем порт для локального API (статистика)
-    API_PORT=$(shuf -i 10000-60000 -n 1)
+    # --- GENERATE CONFIG ---
+    echo -e "${BLUE}>>> Запись конфига...${Font}"
+    API_PORT=$(get_random_port)
 
     cat > "$SERVER_CONF" <<EOF
 server: $listen_str
@@ -126,7 +169,6 @@ auth:
   type: password
   password: $password
 
-# API для статистики (слушает только localhost)
 http:
   listen: 127.0.0.1:$API_PORT
 
@@ -143,12 +185,11 @@ quic:
   maxConnReceiveWindow: 20971520
   
 bandwidth:
-  up: 100 mbps
-  down: 100 mbps
+  up: $bw_up
+  down: $bw_down
 EOF
 
-    # 5. SYSTEMD
-    echo -e "${BLUE}>>> Настройка службы...${Font}"
+    # --- SYSTEMD ---
     cat > /etc/systemd/system/hihy.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -162,6 +203,8 @@ WorkingDirectory=$HY_DIR
 Restart=always
 RestartSec=3
 Environment=HYSTERIA_LOG_LEVEL=info
+# Отключаем лимиты для QUIC
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -171,87 +214,24 @@ EOF
     systemctl enable hihy
     systemctl restart hihy
 
-    # 6. ИТОГ
+    # --- REPORT ---
     public_ip=$(get_ip)
     
-    # Формируем ссылку
+    # Формируем V2RayN/NekoBox URL
+    # Формат: hysteria2://password@host:port/?sni=sni&insecure=1&mport=range#Name
     share_link="hysteria2://$password@$public_ip:$main_port/?sni=$domain&insecure=1"
     if [[ -n "$hopping_range" ]]; then
         share_link="${share_link}&mport=$hopping_range"
     fi
-    share_link="${share_link}#Hysteria-RU"
+    share_link="${share_link}#Hysteria-RU-Node"
 
-    echo -e "\n${GREEN}=========================================${Font}"
-    echo -e "${GREEN}       УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА       ${Font}"
-    echo -e "${GREEN}=========================================${Font}"
+    echo -e "\n${GREEN}=== УСТАНОВКА ЗАВЕРШЕНА ===${Font}"
     echo -e "IP: ${YELLOW}$public_ip${Font}"
     echo -e "Port: ${YELLOW}$main_port${Font}"
-    if [[ -n "$hopping_range" ]]; then
-        echo -e "Hopping: ${YELLOW}$hopping_range${Font}"
-    fi
     echo -e "Password: ${YELLOW}$password${Font}"
-    echo -e "SNI: ${YELLOW}$domain${Font}"
-    echo -e "Masquerade: ${YELLOW}$masq_site${Font}"
-    echo -e "\nСсылка для клиента (v2rayN / NekoBox):"
+    echo -e "Bandwidth: ${YELLOW}$bw_down / $bw_up${Font}"
+    echo -e "\nСсылка для клиента:"
     echo -e "${BLUE}$share_link${Font}"
-    echo -e "${GREEN}=========================================${Font}"
-
-    # Маркер установки
+    
     echo "installed" > "$CONF_FILE"
-}
-
-# === УПРАВЛЕНИЕ ===
-
-start_service() {
-    systemctl start hihy
-    echo -e "${GREEN}Служба запущена.${Font}"
-}
-
-stop_service() {
-    systemctl stop hihy
-    echo -e "${RED}Служба остановлена.${Font}"
-}
-
-restart_service() {
-    systemctl restart hihy
-    echo -e "${GREEN}Служба перезагружена.${Font}"
-}
-
-show_status() {
-    systemctl status hihy --no-pager
-}
-
-show_log() {
-    echo -e "${BLUE}Нажмите Ctrl+C для выхода из логов${Font}"
-    journalctl -u hihy -f
-}
-
-uninstall() {
-    echo -e "${RED}!!! ВНИМАНИЕ !!!${Font}"
-    read -p "Вы действительно хотите удалить Hysteria 2? [y/N]: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        systemctl stop hihy
-        systemctl disable hihy
-        rm /etc/systemd/system/hihy.service
-        systemctl daemon-reload
-        rm -rf "$HY_DIR"
-        rm -f "/usr/bin/hihy"
-        echo -e "${GREEN}Hysteria 2 полностью удалена.${Font}"
-    else
-        echo "Отмена."
-    fi
-}
-
-show_config() {
-    if [ -f "$SERVER_CONF" ]; then
-        echo -e "${BLUE}Текущий конфиг ($SERVER_CONF):${Font}"
-        cat "$SERVER_CONF"
-    else
-        echo -e "${RED}Конфиг не найден!${Font}"
-    fi
-}
-
-# Алиас для перенастройки (просто запускает установку заново)
-re_config() {
-    install_hy2
 }
