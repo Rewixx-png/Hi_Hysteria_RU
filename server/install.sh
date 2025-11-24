@@ -1,49 +1,107 @@
 #!/bin/bash
 
-# === УСТАНОВЩИК HIHY (MODULAR) ===
-# URL твоего репозитория
-REPO_URL="https://github.com/Rewixx-png/Hi_Hysteria_RU.git"
-INSTALL_DIR="/etc/hihy"
-BIN_LINK="/usr/bin/hihy"
-
+# === ЦВЕТА ===
 RED="\033[31m"
 GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
 Font="\033[0m"
 
-echo -e "${GREEN}>>> Установка Hysteria 2 Manager (RU)...${Font}"
+# === ГЛОБАЛЬНЫЕ ПУТИ ===
+HY_DIR="/etc/hihy"
+CONF_DIR="/etc/hihy/conf"
+CERT_DIR="/etc/hihy/cert"
+LOG_DIR="/etc/hihy/log"
+BIN_DIR="/etc/hihy/bin"
+CONF_FILE="${CONF_DIR}/hihy.conf"
+SERVER_CONF="${CONF_DIR}/config.yaml"
+APP_BIN="${BIN_DIR}/appS"
 
-# 1. Проверка Git
-if ! command -v git &> /dev/null; then
-    echo "Git не найден. Устанавливаем..."
-    if [ -f /etc/debian_version ]; then
-        apt update && apt install -y git
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y git
+# === ЛОГОТИП ===
+logo() {
+    echo -e "${GREEN}
+ -------------------------------------------
+|**********      Hi Hysteria       **********|
+|**********    Author: emptysuns   **********|
+|**********    Trans: Rewixx       **********|
+|**********     Version: 1.0.3     **********|
+ -------------------------------------------
+${Font}"
+}
+
+# === ПРОВЕРКИ СИСТЕМЫ ===
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Ошибка: Запустите скрипт от имени root!${Font}"
+        exit 1
     fi
-fi
+}
 
-# 2. Очистка старой установки
-if [ -d "$INSTALL_DIR" ]; then
-    echo "Обнаружена старая версия. Обновляем..."
-    rm -rf "$INSTALL_DIR"
-fi
+check_sys() {
+    if [[ -f /etc/redhat-release ]]; then
+        RELEASE="centos"
+    elif cat /etc/issue | grep -q -E -i "debian"; then
+        RELEASE="debian"
+    elif cat /etc/issue | grep -q -E -i "ubuntu"; then
+        RELEASE="ubuntu"
+    elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
+        RELEASE="centos"
+    elif cat /proc/version | grep -q -E -i "debian"; then
+        RELEASE="debian"
+    elif cat /proc/version | grep -q -E -i "ubuntu"; then
+        RELEASE="ubuntu"
+    elif cat /proc/version | grep -q -E -i "centos|red hat|redhat"; then
+        RELEASE="centos"
+    else
+        RELEASE="unknown"
+    fi
+}
 
-# 3. Клонирование
-echo "Клонирование репозитория..."
-git clone "$REPO_URL" "$INSTALL_DIR"
+install_dependencies() {
+    echo -e "${BLUE}>>> Проверка и установка зависимостей...${Font}"
+    if [[ "${RELEASE}" == "centos" ]]; then
+        yum install -y wget curl socat openssl tar crontabs jq
+    else
+        apt-get update
+        apt-get install -y wget curl socat openssl tar cron jq
+    fi
+    
+    # Создаем папки
+    mkdir -p "$HY_DIR" "$CONF_DIR" "$CERT_DIR" "$LOG_DIR" "$BIN_DIR"
+}
 
-if [ ! -d "$INSTALL_DIR" ]; then
-    echo -e "${RED}Ошибка: Не удалось клонировать репозиторий!${Font}"
-    exit 1
-fi
+# === ПРОВЕРКИ УСТАНОВКИ (ВАЖНО!) ===
+check_install() {
+    if [ ! -f "$CONF_FILE" ]; then
+        echo -e "${RED}Ошибка: Hysteria 2 не установлена!${Font}"
+        echo -e "${YELLOW}Пожалуйста, сначала выберите пункт 1 для установки.${Font}"
+        return 1
+    fi
+    return 0
+}
 
-# 4. Настройка прав
-chmod +x "$INSTALL_DIR/server/hihy"
-chmod +x "$INSTALL_DIR/server/lib/"*.sh
+check_uninstall() {
+    # Функция ничего не блокирует, просто возвращает true, 
+    # так как install_hy2 сам справится с перезаписью.
+    return 0
+}
 
-# 5. Создание симлинка
-rm -f "$BIN_LINK"
-ln -s "$INSTALL_DIR/server/hihy" "$BIN_LINK"
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+get_random_port() {
+    local port=0
+    while true; do
+        port=$(shuf -i 10000-65535 -n 1)
+        if ! lsof -i :$port >/dev/null; then
+            echo $port
+            break
+        fi
+    done
+}
 
-echo -e "${GREEN}>>> Установка завершена!${Font}"
-echo -e "Запустите меню командой: ${GREEN}hihy${Font}"
+get_ip() {
+    local ip=$(curl -s4m8 https://ip.gs)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s4m8 https://api.ipify.org)
+    fi
+    echo $ip
+}
